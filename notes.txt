@@ -1,0 +1,32 @@
+optimization: 
+
+page attention. 
+scheduler.  
+flattened padding.  
+page block kv allocation.  
+cuda graph 
+prefix caching.  
+chunked prefill. 
+Cuda kernels 
+  
+
+  
+architecutre:  
+
+cppvllm/
+  CMakeLists.txt
+  config.h / config.cpp
+  engine/
+    sequence.h
+    block_manager.h / .cpp
+    scheduler.h / .cpp
+    model_runner.h / .cpp
+    llm_engine.h / .cpp
+  model_architecture.cpp        # Llama layers + forward
+  kernels/                      # rmsnorm, rope, paged_attention, sampler (.cu)
+  utils/                        # tensor.h, safetensors.cpp, tokenizer.cpp  
+    tensor.h 
+    safetensors.cpp  
+    tokenizer.cpp                       
+  bench.cpp
+  example.cpp
