@@ -39,7 +39,18 @@ file(GLOB LIB_SOURCES CONFIGURE_DEPENDS *.cpp engine/*.cpp utils/*.cpp)
 list(FILTER LIB_SOURCES EXCLUDE REGEX "/(example|bench|test)\\.cpp$")   # programs, not library code
 
 add_library(cppvllm STATIC ${LIB_SOURCES})
-target_include_directories(cppvllm PUBLIC ${CMAKE_SOURCE_DIR} ${CMAKE_SOURCE_DIR}/engine)
+
+# FIX: Added ${TORCH_INCLUDE_DIRS} when building with Torch
+if(CPPVLLM_WITH_TORCH)
+  target_include_directories(cppvllm PUBLIC 
+    ${CMAKE_SOURCE_DIR} 
+    ${CMAKE_SOURCE_DIR}/engine
+    ${TORCH_INCLUDE_DIRS}
+  )
+else()
+  target_include_directories(cppvllm PUBLIC ${CMAKE_SOURCE_DIR} ${CMAKE_SOURCE_DIR}/engine)
+endif()
+
 target_link_libraries(cppvllm PUBLIC nlohmann_json::nlohmann_json)
 if(CPPVLLM_WITH_TORCH)
   target_link_libraries(cppvllm PUBLIC ${TORCH_LIBRARIES})

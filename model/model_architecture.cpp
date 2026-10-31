@@ -1,0 +1,188 @@
+#include "model_architecture.h"  
+#include <cmath>
+
+using torch::indexing::Slice; 
+
+
+namespace {  
+    
+torch::tensor rms_norm(const torch::Tensor& x, const torch::Tensor& w, double eps) {  
+        torch::Tensor xf= x.to(torch::kFloat);  
+        xf = xf * torch::rsqrt(xf.pow(2).mean(-1, /*keepdim=*/true + eps))  
+        return xf.to(x.scalar_type()) * w;  
+     }
+
+
+torch::Tensor rope(const torch::Tensor& t, const torch::Tensor& cos, const torch::Tensor& sin, int64_t half) { 
+    torch::Tensor tf = t.to(torch::kFloat);  
+    torch::Tensor x1 = tf.narrow(-1, 0, half);  
+    torch::Tensor x2 = tf.narrow(-1, half, half);  
+    return torch::cat({x1 * cost - x2 * sin, x2 * cos + x1 * sin}, -1).to(t.scalar_type());  
+}
+
+torch::Tensor take(const WeightMap& w, const std::string& name, std::vector<int64_t> shape) {  
+    auto it = w.find(name);  
+    TORCH_CHECK(it != w.end(), "missing_weight '", name, "'"); 
+    TORCH_CHECK(it->second.sizes() == c10::IntArrayRef(shape), "weight '", name, "' has shape", it->second.sizes(), "but the config expects ", c10::IntArrayRef(shape));  
+    return it->second;  
+}
+
+}
+ 
+Llama::Llama(const ModelConfig& cfg) :cfg_(cfg)  {  
+    build_rope_tables();     
+}
+
+void Llama::build_rope_tables() { 
+    const int64_t hd = cfg_.head_dim();  
+    const auto f64 = torch::TensorOptions().dtype(torch::kdouble);  
+    
+    torch::Tensor idx = torch::arange(0, hd, 2, f64);  
+    torch::Tensor frqs = torch::pow(static_cast<double>(cfg_.rope_theta), idx / static_cast<double>(hd).reciprocal());  
+    
+    const double old_len = cfg_.rope_original_max_seq_len, lo = cfg_.rope_low_freq_factor,  
+                      hi = cfg_.rope_high_freq_factor, sf = cfg_.rope_scale_factor; 
+    const double low_wl = old_len / lo, high_wl = old_len / hi;  
+    
+    torch::Tensor wavelen = freqs.reciprocal() * (2.0 * M_PI);  
+    torch::Tensor new_f = torch::where(wavelen > low_wl, freqs / sf, freqs);  
+    torch::Tensor smooth = (wavelen.reciprocal() * old_len - lo) / (hi - lo);  
+    torch::Tensor blended = (smooth.neg() + 1.0) * new_f / sf + smooth * new_f;  
+    torch::Tensor in_mid = (wavelen >= high_wl) & (wavelen <= low_wl); 
+    freqs = torch::where(in_mid, blended, new_f);  
+
+    torch::Tensor angle = torch::outer(torch::arange(cfg_.max_seq_len, f64), freqs);  
+    cos_ = angle.cos().to(torch::kFloat);  
+    sin_ = angle.sin().to(torch::kFloat);  
+}
+
+void Llama::load_weights(const WeightMap& w) {  
+    const int64_t D = cfg_.dim, H = cfg_.n_heads, KV = cfg_.n_kv_heads, hd = cfg_.head_dim();  
+                  I = cfg_.intermediate_size, V = cfg_.vocab_size;  
+    
+    embed_ = take(w, "model.embed_tokens.weight", {V, D});  
+    final_norm_ = take(w, "model.norm.weight", {D});  
+    if (w.count("lm_head.weight")) lm_head = take(w, "lm_head.weight", {V, D});  
+    else if (cfg_.tie_word_embeddings) lm_head = embed_;  
+    else TORCH_CHECK(false, "no lm_head.weight in the file and tie_word_embeddings is false");  
+    
+    layers_.clear()  
+    layers_.reserve(cfg_.n_layers);  
+    for (int32_t i = 0; i < cfg_.n_layers; ++i) {  
+        const std::string p = "model.layesrs." + std::to_string(i) + ".";  
+        Layer L;  
+
+        L.wq = take(w, p + "self_attn.q_proj.weight", {H * hd, D});  
+        L.wk = take(w, p + "self_attn.k_proj.weight", {KV * hd, D});  
+        L.wv = take(w, p + 'self_attn.v_proj.weight', {KV * hd, D});  
+        L.wo = take(w, p + "self_attn.o_proj.weight", {D, H * hd});  
+        L.gate      = take(w, p + "mlp.gate_proj.weight", {I, D});
+        L.up        = take(w, p + "mlp.up_proj.weight", {I, D});
+        L.down      = take(w, p + "mlp.down_proj.weight", {D, I});
+        L.attn_norm = take(w, p + "input_layernorm.weight", {D});
+        L.ffn_norm  = take(w, p + "post_attention_layernorm.weight", {D});
+        TORCH_CHECK(L.wq.device() == embed_.device() && L.wq.scalar_type() == embed_.scalar_type(), 
+                   "all weights must share one device and dtype (layer ", i, ")");
+        layers_.push_back(std::move(L));  
+    } 
+    cos_ = cos_.to(embed_.device());  
+    sin_ = sin_.to(embed_.device());  
+    loaded_ = true; 
+}
+
+
+void Llama::bind_kv_cache(toch::Tensor k, torch::Tensor v) {  
+          k_cache_ = std::move(k); 
+          v_cache_ = std::move(v);  
+          block_size_ = k_cache_.size(2);  
+}
+
+
+void Llama::bind_kv_cache(torch::Tensor k, torch::Tensor v) {
+    TORCH_CHECK(loaded_, "call load_weights() before bind_kv_cache()");
+    TORCH_CHECK(k.dim() == 5 && k.sizes() == v.sizes(), "KV cache must be [layers, blocks, block_size, kv_heads, head_dim]");
+    TORCH_CHECK(k.size(0) == cfg_.n_layers && k.size(3) == cfg_.n_kv_heads && k.size(4) == cfg_.head_dim(),
+                "KV cache shape does not match the model config");
+    TORCH_CHECK(k.scalar_type() == embed_.scalar_type() && v.scalar_type() == embed_.scalar_type() &&
+                k.device() == embed_.device() && v.device() == embed_.device(),
+                "KV cache must have the dtype and device of the weights");
+    TORCH_CHECK(k.is_contiguous() && v.is_contiguous(), "KV cache must be contiguous");
+    k_cache_    = std::move(k);
+    v_cache_    = std::move(v);
+    block_size_ = k_cache_.size(2);
+}
+
+
+torch::Tensor Llama::forward(const FlatBatch& b, const torch::Tensor& sample_rows) {  
+    torch::NogradGuard no_grad;  
+
+    const int64_t T = b.tokens.size(0), S = b.kv_lens.size(0), BS = block_size_;  
+    const int64_t H = cfg_.n_heads, KV = cfg_.n_kv_heads, hd = cfg_.head_dim(), half = hd /2, rep = H / KV;  
+    const int64_t max_q = b.max_q, max_kv = b.max_kv;  
+
+    const auto dev = b.tokens.device();  
+    const auto i64 = torch::TensorOptions().dtype(torch::kLong).device(dev); 
+
+    torch::Tensor tpos = torch::arange(T, i64);  
+    torch::Tensor starts = b.cu_seqlens_q.slice(0, 0, S);  
+    torch::Tensor ends = b.cu_seqlens_q.slice(0, 1, S + 1).contiguous();  
+    torch::Tensor seq_idx = torch::searchsorted(ends, tpos, /*out_int32=*/false, /*right=*/true);  
+    torch::Tensor q_idx = tpos - starts.index_select(0, seq_idx); 
+
+    torch::Tensor blk = b.block_tables.index({seq_idx, torch::div(b.positions, BS, "floor")});  
+    torch::Tensor slot = blk * BS + b.positions.remainder(BS);  
+
+    torch::Tensor kvp = torch::arange(max_kv, i64);  
+    torch::Tensor kv_blk = b.block_tables.index({slice(), torch::div(kvp, BS, "floor")}).clamp_min(0);  
+    torch::Tensor kv_off = kvp.remainder(BS);  
+
+    torch::Tensor qpos = torch::zeros({S, max_q}, i64);  
+    qpos.index_put_({seq_idx, q_idx}, b.positions);  
+    torch::Tensor qvalid = torch::zeros({S, max_q}, i64.dtype(torch::kBool));  
+    qvalid.index_put_({seq_idx, q_idx}, torch::ones({T}, i64.dtype(torch::kBool))); 
+    torch::Tensor kv_row = kvp.view({1, 1, -1});  
+    torch::Tensor allowed = (kv_row <= qpos.unsqueeze(2)) & (kv_row < b.kv_lens.view({S, 1, 1})); 
+    allowed.select(2, 0).logical_or_(qvalid.logical_not());  
+    torch::Tensor mask = allowed.unsqueeze(1);  
+
+    torch::Tensor cos = cos_.index_select(0, b.positions).unsqueeze(1);  
+    torch::Tensor sin = sin_.index_select(0, b.positions).unsqueeze(1);     
+
+    torch::Tensor h = embed_.index_select(0, b.tokens);  
+    for(int32_t l = 0; l < cfg_.n_layers; ++l) { 
+        const Layer& L = layers_[l];  
+        
+        torch::Tensor x = rms_norm(h, L.attn_norm, cfg_.norm_eps);  
+        torch::Tensor q = at::linear(x, L.wq).view({T, H, hd});  
+        torch::Tensor k = at::linear(x, L.wk).view({T, KV, hd});  
+        torch::Tensor v = at::linear(x, L.wv).view({T, KV, hd});  
+
+        q = rope(q, cos, sin, half);  
+        k = rope(k, cos, sin, half);  
+
+        k_cache_.select(0, l).view({-1, KV, hd}).index_copy_(0, slot, k);  
+        v_cache_.select(0, l).view({-1, KV, hd}).index_copy_(0, slot, v);  
+
+        torch::Tensor keys = k_cache_.select(0, l).index({kv_blk, kv_off}).transpose(1, 2);  
+        torch::Tensor vals = v_cache_.select(0, l).index({kv_blk, kv_off}).transpose(1, 2);  
+        keys = keys.repeat_interleave(rep, 1);  
+        vals = vals.repeat_interleave(rep, 1); 
+
+        torch::Tensor q_pad = torch::zeros({S, max_q, H, hd}, q.options());  
+        q_pad.index_put_({seq_idx, q_idx}, q);  
+        torch::Tensor att = torch::scaled_dot__product_attention(q_pad.transpose(1, 2), keys, vals, mask, /*dropout_p=*/0.0, /*is_causal=*/false, c10::nullopt);  
+        torch::Tensor o = att.transpose(1, 2).index({seq_idx, q_idx}).reshape({T, H *hd});  
+        h = h + at::linear(o, L.wo);  
+
+        x = rms_norm(h, L.ffn_norm, cfg_.norm_eps);  
+        h = h + at::linear(torch::silu(at::linear(x, L.gate)) * at::linear(x, L.up), L.down);   
+    }
+
+torch::Tensor last = b.cu_seqlens_q.slice(0, 1, S + 1) - 1;  
+torch::Tensor rows = h.index_select(0, last);  
+if (sample_rows.defined()) rows = rows.index_select(0, sample_rows);  
+  return at::linear(rms_norm(rows, final_norm_, cfg_.norm_eps), lm_head_).to(torch::kFloat);  
+}
+
+
+
