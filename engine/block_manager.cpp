@@ -54,19 +54,19 @@ void BlockManager::unlink_free(int32_t id) {
 }
 
 //LRF(least recently freed) block. 
-int32_t BlockManager::take_fresh_block() {  
-   assert(free_head_ != -1 && "out of KV blocks: must check can_allocate/can_append");  
+int32_t BlockManager::take_fresh_block() {
+   assert(free_head_ != -1 && "out of KV blocks: must check can_allocate/can_append");
    const int32_t id = free_head_;
-   unlink_free(id);  
+   unlink_free(id);
 
-   BlockMeta& b = meta_[id];  
-   if (b.hash != kNoHash) { 
-     auto it = hash_to_block_.find(b.hash);  
-     if (it != hash_to_block_.end() && it->second == id) hash_to_block_.erase(id);
-     b.hash = kNoHash; 
+   BlockMeta& b = meta_[id];
+   if (b.hash != kNoHash) {
+     auto it = hash_to_block_.find(b.hash);
+     if (it != hash_to_block_.end() && it->second == id) hash_to_block_.erase(it);   // keyed by hash, not id
+     b.hash = kNoHash;
    }
-   b.ref_count = 1;  
-   return id; 
+   b.ref_count = 1;
+   return id;
 }
 
 int32_t BlockManager::lookup(std::span<const int32_t> tokens, uint64_t hash) const {  
@@ -74,7 +74,7 @@ int32_t BlockManager::lookup(std::span<const int32_t> tokens, uint64_t hash) con
    if (it == hash_to_block_.end()) return -1; 
    const int32_t id = it->second; 
    const int32_t* stored = block_tokens_.data() + static_cast<size_t>(id) * kBS;  
-   if (tokens.size() != kBS || !std::equal(tokens.begin(), tokens.end(), stored)) return -1; 
+   if (tokens.size() != static_cast<size_t>(kBS) || !std::equal(tokens.begin(), tokens.end(), stored)) return -1; 
    return id; 
 }
 

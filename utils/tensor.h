@@ -1,5 +1,8 @@
 #pragma once
+#include "utils/safetensors.h"
+
 #include <torch/torch.h>
+
 #include <cstdint>
 #include <optional>
 #include <span>
@@ -9,24 +12,8 @@
 #include <type_traits>
 #include <unordered_map>
 
-// Assumed definitions matching your external safetensors bindings
-enum class STDType { BOOL, U8, I8, I16, I32, I64, F16, BF16, F32, F64 };
-struct TensorInfo {
-    STDType dtype;
-    std::vector<int64_t> shape;
-    int64_t numel() const { return 1; } // Mocked placeholder
-    std::string name;
-};
-class SafeTensorsFile {
-public:
-    void* data(const TensorInfo&) const { return nullptr; }
-    const TensorInfo& info(std::string_view) const { static TensorInfo t; return t; }
-    std::vector<TensorInfo> tensors() const { return {}; }
-};
-inline std::vector<std::string> list_safetensors_files(const std::string&) { return {}; }
-
 [[nodiscard]] inline at::ScalarType to_torch_dtype(STDType t) {
-    switch(t) {
+    switch (t) {
         case STDType::BOOL: return at::kBool;
         case STDType::U8:   return at::kByte;
         case STDType::I8:   return at::kChar;
@@ -37,36 +24,38 @@ inline std::vector<std::string> list_safetensors_files(const std::string&) { ret
         case STDType::BF16: return at::kBFloat16;
         case STDType::F32:  return at::kFloat;
         case STDType::F64:  return at::kDouble;
-        default: throw std::runtime_error("Unknown type");
+        default: throw std::runtime_error("tensor.h: unsupported safetensors dtype");
     }
 }
 
+// Zero-copy CPU view into the mmap'd file. Valid only while `f` is alive.
 [[nodiscard]] inline torch::Tensor tensor_view(const SafeTensorsFile& f, const TensorInfo& ti) {
     const auto options = torch::TensorOptions().dtype(to_torch_dtype(ti.dtype)).device(torch::kCPU);
     if (ti.numel() == 0) return torch::empty(ti.shape, options);
-    void* p = const_cast<void*>(f.data(ti));
+    // data() returns const std::byte*; from_blob wants void*
+    void* p = const_cast<void*>(static_cast<const void*>(f.data(ti)));
     return torch::from_blob(p, ti.shape, options);
 }
 
-[[nodiscard]] inline torch::Tensor load_tensor(const SafeTensorsFile& f, std::string_view name, torch::Device device, std::optional<at::ScalarType> dtype = std::nullopt) {
+[[nodiscard]] inline torch::Tensor load_tensor(const SafeTensorsFile& f, std::string_view name, torch::Device device,
+                                               std::optional<at::ScalarType> dtype = std::nullopt) {
     const TensorInfo& ti = f.info(name);
     const torch::Tensor src = tensor_view(f, ti);
     at::ScalarType target = src.scalar_type();
-    if(dtype.has_value() && at::isFloatingType(src.scalar_type())) target = *dtype;
-    return src.to(device, target, /*non_blocking=*/false, /*copy=*/true);
+    if (dtype.has_value() && at::isFloatingType(src.scalar_type())) target = *dtype;
+    return src.to(device, target, /*non_blocking=*/false, /*copy=*/true);   // copy: result must outlive the mmap
 }
 
 using WeightMap = std::unordered_map<std::string, torch::Tensor>;
 
-[[nodiscard]] inline WeightMap load_weights(const std::string& path, torch::Device device, std::optional<at::ScalarType> dtype = std::nullopt) {
+[[nodiscard]] inline WeightMap load_weights(const std::string& path, torch::Device device,
+                                            std::optional<at::ScalarType> dtype = std::nullopt) {
     WeightMap out;
-    for(const std::string& file : list_safetensors_files(path)) {
+    for (const std::string& file : list_safetensors_files(path)) {
         const SafeTensorsFile st(file);
         for (const TensorInfo& ti : st.tensors()) {
             auto [it, inserted] = out.try_emplace(ti.name);
-            if(!inserted) {
-                throw std::runtime_error("tensor.h: tensor " + ti.name + " appears in multiple files");
-            }
+            if (!inserted) throw std::runtime_error("tensor.h: tensor " + ti.name + " appears in multiple files");
             it->second = load_tensor(st, ti.name, device, dtype);
         }
     }
@@ -89,10 +78,10 @@ public:
     StagedBuffer(const StagedBuffer&) = delete;
     StagedBuffer& operator=(const StagedBuffer&) = delete;
     StagedBuffer(StagedBuffer&&) = default;
-    StagedBuffer& operator=(StagedBuffer&&) = default; 
+    StagedBuffer& operator=(StagedBuffer&&) = default;
 
     [[nodiscard]] int64_t capacity() const noexcept { return capacity_; }
-    
+
     [[nodiscard]] std::span<T> host() noexcept {
         return std::span<T>(host_.data_ptr<T>(), static_cast<size_t>(capacity_));
     }

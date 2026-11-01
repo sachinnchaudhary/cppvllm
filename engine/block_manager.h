@@ -1,6 +1,7 @@
 #pragma once 
 #include "sequence.h"  
 #include <unordered_map>
+#include <span>
 #include <vector>  
 #include <cstddef>
 #include <cstdint>

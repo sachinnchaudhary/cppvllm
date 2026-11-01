@@ -1,169 +1,171 @@
 #include "utils/safetensors.h"
 
+#include <fcntl.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <unistd.h>
 
-#include <bit>  
-#include <algorithm> 
-#include <cerrno>  
-#include <cstring>  
-#include <limits>  
-#include <stdexcept>  
+#include <algorithm>
+#include <bit>
+#include <cerrno>
+#include <cstring>
+#include <filesystem>
+#include <limits>
+#include <stdexcept>
 
-#include <nlohmann/json.hpp> 
+#include <nlohmann/json.hpp>
 
+static_assert(std::endian::native == std::endian::little, "safetensors assumes a little-endian host");
 
-//file is in litte endian so does the host. 
-static_assert(std::endian::native == std::endian::little, "SafeTensors assume little endian") 
+namespace {
+constexpr uint64_t kMaxHeaderBytes = 100ull * 1024 * 1024;
 
-namespace st {  
-  namespace { 
-    constexpr uint64_t kMaxHeaderBytes = 100ul * 1024 * 1024; 
+struct DTypeRow { const char* name; STDType dtype; size_t size; };
+constexpr DTypeRow kDTypes[] = {
+    {"BOOL", STDType::BOOL, 1}, {"U8", STDType::U8, 1},   {"I8", STDType::I8, 1},
+    {"I16", STDType::I16, 2},   {"U16", STDType::U16, 2}, {"F16", STDType::F16, 2}, {"BF16", STDType::BF16, 2},
+    {"I32", STDType::I32, 4},   {"U32", STDType::U32, 4}, {"F32", STDType::F32, 4},
+    {"I64", STDType::I64, 8},   {"U64", STDType::U64, 8}, {"F64", STDType::F64, 8},
+};
 
-    struct DTypeRow {const char* name; DType dtype; size_t size;}  
-    const DTypeRow kDTypes[] = {  
-    {"BOOL", DType::BOOL, 1},       {"U8", DType::U8, 1},     {"I8", DType::I8, 1},
-    {"F8_E5M2", DType::F8_E5M2, 1}, {"F8_E4M3", DType::F8_E4M3, 1},
-    {"I16", DType::I16, 2},         {"U16", DType::U16, 2},   {"F16", DType::F16, 2},
-    {"BF16", DType::BF16, 2},       {"I32", DType::I32, 4},   {"U32", DType::U32, 4},
-    {"F32", DType::F32, 4},         {"F64", DType::F64, 8},   {"I64", DType::I64, 8},
-    {"U64", DType::U64, 8},
-    };
+[[noreturn]] void fail(const std::string& path, const std::string& why) {
+    throw std::runtime_error("safetensors: " + path + ": " + why);
+}
+}  // namespace
+
+size_t sdtype_size(STDType t) noexcept {
+    for (const auto& r : kDTypes) if (r.dtype == t) return r.size;
+    return 0;
+}
+const char* sdtype_name(STDType t) noexcept {
+    for (const auto& r : kDTypes) if (r.dtype == t) return r.name;
+    return "?";
 }
 
-size_t dtype_size(DType d) noexcept {  
-    for (const auto& r: kDTypes) if (r.dtype == d) return r.size;  
-    return 0; 
+SafeTensorsFile::SafeTensorsFile(const std::string& path) : path_(path) {
+    const int fd = ::open(path_.c_str(), O_RDONLY | O_CLOEXEC);
+    if (fd < 0) fail(path_, std::string("cannot open: ") + std::strerror(errno));
+
+    struct stat sb;
+    if (::fstat(fd, &sb) != 0) { ::close(fd); fail(path_, std::string("fstat failed: ") + std::strerror(errno)); }
+    map_size_ = static_cast<size_t>(sb.st_size);
+    if (map_size_ < 8) { ::close(fd); fail(path_, "file is smaller than the 8-byte length prefix"); }
+
+    void* p = ::mmap(nullptr, map_size_, PROT_READ, MAP_PRIVATE, fd, 0);
+    ::close(fd);
+    if (p == MAP_FAILED) fail(path_, std::string("mmap failed: ") + std::strerror(errno));
+    map_ = p;
+
+    try { parse_header(); } catch (...) { release(); throw; }
 }
 
-const char* dtype_name(DType d) noexcept { 
-   for (const auto& r: KDTypes) if (r.dtype == d) return r.name;  
+SafeTensorsFile::~SafeTensorsFile() { release(); }
+
+void SafeTensorsFile::release() noexcept {
+    if (map_) ::munmap(map_, map_size_);
+    map_ = nullptr;
 }
 
-std::shared_ptr<SafeTensorsFile> SafeTensorsFile::open(const std::string& path) { 
-    return std::shared_ptr<SafeTensorsFile>(new SafeTensorsFile(path));
-} 
+bool SafeTensorsFile::contains(std::string_view name) const noexcept { return index_.find(name) != index_.end(); }
 
-SafeTensorsFile::SafeTensorsFile(std::string path) : path_(std::move(path)) {  
-    auto fail = [&](const std::string& why) -> void  { 
-        throw std::runtime_error("safetensors: " + path_ + ": " + why);
-    };
-    const int fd = ::open(path_.c_str(), O_RDONLY | O_CLOEXEC);  
-    if (fd < 0) fail(std::string("cannot open: ") + std::strerror(errno));  
-    
-    struct stat sb; 
-    if (::fstat(fd, &sb) != 0) {::close(fd); fail(std::string("fstat failed: ")+ std::strerror(errno));}
-    size_ = static_cast<size_t>(sb.st_size);  
-    if (size_ < 8) {::close(fd); fail("file is smaller than the 8-bytes len prefix"); } 
-    
-    void* p = ::mmap(nullptr, size_, PROT_READ, MAP_PRIVATE, fd, 0) 
-    ::close(fd);  
-    if (p == MAP_FAILED) fail(std::string("mmap failed: ") + std::strerror(errno));  
-    base_ = static_cast<const uint8_t*> (p);  
+const TensorInfo& SafeTensorsFile::info(std::string_view name) const {
+    auto it = index_.find(name);
+    if (it == index_.end()) fail(path_, "no tensor named '" + std::string(name) + "'");
+    return tensors_[it->second];
+}
 
-    try {  
-        parse_header();   
-    }catch(...) {  
-        ::munmap(const_cast<uint8_t*>(base_), size_);  
-        base_ = nullptr; 
-        throw; 
+const std::byte* SafeTensorsFile::data(const TensorInfo& t) const noexcept {
+    return reinterpret_cast<const std::byte*>(static_cast<const uint8_t*>(map_) + data_offset_ + t.begin);
+}
+
+void SafeTensorsFile::parse_header() {
+    const auto* base = static_cast<const uint8_t*>(map_);
+    uint64_t header_len = 0;
+    std::memcpy(&header_len, base, 8);
+    if (header_len > kMaxHeaderBytes) fail(path_, "header length " + std::to_string(header_len) + " exceeds the 100 MB limit");
+    if (header_len > map_size_ - 8) fail(path_, "header length runs past the end of the file (truncated file?)");
+
+    data_offset_ = 8 + static_cast<size_t>(header_len);
+    const uint64_t data_len = map_size_ - data_offset_;
+
+    nlohmann::json j;
+    try {
+        const char* h = reinterpret_cast<const char*>(base + 8);
+        j = nlohmann::json::parse(h, h + header_len);
+    } catch (const nlohmann::json::exception& e) {
+        fail(path_, std::string("header is not valid JSON: ") + e.what());
     }
-}
-} 
+    if (!j.is_object()) fail(path_, "header JSON is not an object");
 
-SafeTensorsFile::~SafeTensorsFile() {  
-    if (base_) ::munmap(const_cast<uint8_t*>(base_), size);  
-}
+    struct Raw { std::string name; STDType dtype; std::vector<int64_t> shape; uint64_t begin, end; };
+    std::vector<Raw> raws;
+    raws.reserve(j.size());
 
-const TensorInfo& SafeTensorsFile::info(const std::string& name) const { 
-   auto it = index_.find(name);  
-   if (it == index_.end) 
-     throw std::runtime_error("safetensors: " + path_ + ": no tensor named '" + name + "'");  
-   return tensors_[it->second];   
-}
+    for (auto it = j.begin(); it != j.end(); ++it) {
+        const std::string& name = it.key();
+        if (name == "__metadata__") continue;
+        const nlohmann::json& e = it.value();
+        try {
+            const std::string dt = e.at("dtype").get<std::string>();
+            const auto* row = std::find_if(std::begin(kDTypes), std::end(kDTypes),
+                                           [&](const DTypeRow& r) { return dt == r.name; });
+            if (row == std::end(kDTypes)) fail(path_, "tensor '" + name + "' has unknown dtype '" + dt + "'");
 
-void SafeTensorsFile::parse_header(){ 
-    auto fail = [&](const std::string& why) -> void { 
-        throw std::runtime_error("safetensors: " + path_ + ": no tensor named '" + why + "'")
-    };
-   uint64_t header_len = 0;  
-   std::memcpy(&header_len, base_, 8);  
-   if (header_len > kMaxHeaderBytes) fail("header length " + std::to_string(header_len) + " exceeds the 100 MB limit");
-   if (header_len > size_ - 8) fail("header length runs past the end of the file (truncated file?)");
+            Raw r;
+            r.name = name;
+            r.dtype = row->dtype;
+            r.shape = e.at("shape").get<std::vector<int64_t>>();
+            const auto offs = e.at("data_offsets").get<std::vector<uint64_t>>();
+            if (offs.size() != 2) fail(path_, "tensor '" + name + "': data_offsets must have 2 entries");
+            r.begin = offs[0];
+            r.end = offs[1];
+            if (r.begin > r.end) fail(path_, "tensor '" + name + "': data_offsets are reversed");
+            if (r.end > data_len) fail(path_, "tensor '" + name + "': data_offsets run past the end of the file");
 
-   const size_t data_begin = 8 + static_cast<size_t>( header_len);  
-   const size_t data_len = size_ - data_begin;  
-
-   nlohmann::json j;  
-   try { 
-    const char* h = reinterpret_cast<const char*> (base_ + 8);  
-    j = nlohmann::json::parse(h, h + header_len);  
-   }  catch (const nlohmann::json::exception& e) { 
-    fail(std::string("header is not valid JSON: ") + e.what());  
-   }
-   if (!j.is_object()) fail ("header json is not object");  
-
-   struct Raw { std::string name; DType dtype; std::vector<int64_t>shape; uint64_t begin, end};  
-   std::vector <Raw> raws;  
-   raws.reserve(j.size()); 
-
-   for (auto it =j.begin(); it != j.end(); it++) { 
-    const std::string& name = it.key();  
-    if (name == "__metadata__") continue;  
-    const nlohmann::json& e = it.value();  
-    
-    try { 
-        const std::string dt = e.at("dtype").get<std::string>();  
-        const auto* row = std::find_if(std::begin(kDTypes), std::end(kDTypes), [&](const DTypeRow& r) {return dt == r.name;});  
-        if (row == std::end(kDTypes)) fail("tensor '" + name + "' has unknown dtype '" + dt + "'"); 
-        
-        Raw r;  
-        r.name = name;  
-        r.dtype = row -> dtype;  
-        r.shape = e.at("shape").get<std::vector<int64_t>>();  
-        
-        const auto offs = e.at("data_offsets").get<std::vector<uint64_t>>();  
-        if (offs.size() != 2) fail("tensor '" + name + "': data_offsets must have 2 entries"); 
-        r.begin = offs[0];  
-        r.end = offs[1];  
-        if (r.begin > r.end)fail("tensor '" + name + "': data_offsets are reversed"); 
-        if (r.end > data_len) fail("tensor '" + name + "': data_offsets run past the end of the file"); 
-
-        uint64_t expect = row->size; 
-        for(int64_t d : r.shape) {
-            if (d < 0) fail("tensor '" + name + "' has a negative dimension");  
-            if (d != 0 && expect > std::numeric_limit<uint64_t>::max() / static_cast<uint64_t>(d))
-            fail("tensor '" + name + "': shape overflows"); 
-            expect *= static_cast<uint64_t>(d);   
+            uint64_t expect = row->size;
+            for (int64_t d : r.shape) {
+                if (d < 0) fail(path_, "tensor '" + name + "' has a negative dimension");
+                if (d != 0 && expect > std::numeric_limits<uint64_t>::max() / static_cast<uint64_t>(d))
+                    fail(path_, "tensor '" + name + "': shape overflows");
+                expect *= static_cast<uint64_t>(d);
+            }
+            if (r.end - r.begin != expect)
+                fail(path_, "tensor '" + name + "': shape and dtype imply " + std::to_string(expect) +
+                            " bytes but data_offsets span " + std::to_string(r.end - r.begin));
+            raws.push_back(std::move(r));
+        } catch (const nlohmann::json::exception& ex) {
+            fail(path_, "tensor '" + name + "' has a malformed entry: " + ex.what());
         }
-        if (r.end() - r.begin() != expect ) 
-         fail("tensor '" + name + "': shape and dtype imply " + std::to_string(expect) +
-                     " bytes but data_offsets span " + std::to_string(r.end - r.begin));
-        raws::push_back(std::move(r));  
     }
-    catch (const nlohmann::json::exception& ex) { 
-        fail("tensor '" + name + "' has a malformed entry: " + ex.what());
+
+    std::sort(raws.begin(), raws.end(), [](const Raw& a, const Raw& b) {
+        return a.begin != b.begin ? a.begin < b.begin : a.end < b.end;
+    });
+
+    uint64_t cursor = 0;
+    for (const Raw& r : raws) {
+        if (r.begin != cursor) fail(path_, "tensor '" + r.name + "': offsets leave a gap or overlap the previous tensor");
+        cursor = r.end;
     }
-   }
+    if (cursor != data_len) fail(path_, "tensor data does not cover the whole data region");
 
-std::sort(rows.begin(), rows.end(), [](const Row& a, const Row& b)
-  {return a.begin != b.begin ? a.begin < b.begin : a.end < b.end;});
+    tensors_.reserve(raws.size());
+    for (Raw& r : raws) {
+        const size_t esz = sdtype_size(r.dtype);
+        if (reinterpret_cast<uintptr_t>(base + data_offset_ + r.begin) % esz != 0)
+            fail(path_, "tensor '" + r.name + "' is not aligned to its element size");
+        index_.emplace(r.name, tensors_.size());
+        tensors_.push_back(TensorInfo{std::move(r.name), r.dtype, std::move(r.shape), r.begin, r.end});
+    }
+}
 
-uint64_t cursor = 0;  
-for (const Row& r: raws) { 
-    if (r.begin != cursor) fail("tensor '" + r.name + "': offsets leave a gap or overlap the previous tensor"); 
-    cursor = r.end();  
-
-if (cursor != data_len) fail("tensor data does not cover the whole data region"); 
-tensors._reserve(row.size());  
-for (Raws& r: raws){ 
-    const uint8_t* ptr = base_ + data_begin + r.begin;  
-    const size_t esz = dtype_size(r.dtype);  
-    if (reinterpret_cast<uintptr_t>(ptr) % esz != 0) 
-    fail("tensor '" + r.name + "' is not aligned to its element size"); 
-    
-    index_.emplace(r.name(), tensors_.size());  
-    tensors_.push_back(TensorInfo{std::move(r.name), r.dtype, std::move(r.shape), ptr, static_cast<size_t>(r.end - r.begin)}); 
-  }  
-
- }
-
+std::vector<std::string> list_safetensors_files(const std::string& path) {
+    namespace fs = std::filesystem;
+    std::vector<std::string> out;
+    if (fs::is_regular_file(path)) { out.push_back(path); return out; }
+    for (const auto& e : fs::directory_iterator(path))
+        if (e.is_regular_file() && e.path().extension() == ".safetensors") out.push_back(e.path().string());
+    if (out.empty()) throw std::runtime_error("no .safetensors files in " + path);
+    std::sort(out.begin(), out.end());
+    return out;
 }

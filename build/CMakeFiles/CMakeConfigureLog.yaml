@@ -7,7 +7,7 @@ events:
       - "C:/Users/Public/Miniconda3/Lib/site-packages/cmake/data/share/cmake-3.31/Modules/CMakeDetermineSystem.cmake:205 (message)"
       - "CMakeLists.txt:2 (project)"
     message: |
-      The system is: Windows - 10.0.26200 - AMD64
+      The system is: Windows - 10.0.26300 - AMD64
   -
     kind: "message-v1"
     backtrace:
@@ -63,8 +63,8 @@ events:
     checks:
       - "Detecting CXX compiler ABI info"
     directories:
-      source: "C:/Users/sachin chaudhary/cvllm/build/CMakeFiles/CMakeScratch/TryCompile-gxolpd"
-      binary: "C:/Users/sachin chaudhary/cvllm/build/CMakeFiles/CMakeScratch/TryCompile-gxolpd"
+      source: "C:/Users/sachin chaudhary/cvllm/build/CMakeFiles/CMakeScratch/TryCompile-c1j9k3"
+      binary: "C:/Users/sachin chaudhary/cvllm/build/CMakeFiles/CMakeScratch/TryCompile-c1j9k3"
     cmakeVariables:
       CMAKE_CXX_FLAGS: "/DWIN32 /D_WINDOWS /GR /EHsc"
       CMAKE_CXX_FLAGS_DEBUG: "/Zi /Ob0 /Od /RTC1"
@@ -74,11 +74,11 @@ events:
       variable: "CMAKE_CXX_ABI_COMPILED"
       cached: true
       stdout: |
-        Change Dir: 'C:/Users/sachin chaudhary/cvllm/build/CMakeFiles/CMakeScratch/TryCompile-gxolpd'
+        Change Dir: 'C:/Users/sachin chaudhary/cvllm/build/CMakeFiles/CMakeScratch/TryCompile-c1j9k3'
         
-        Run Build Command(s): C:/Users/Public/Miniconda3/Scripts/ninja.exe -v cmTC_f39a6
-        [1/2] C:\\PROGRA~2\\MICROS~2\\2022\\BUILDT~1\\VC\\Tools\\MSVC\\1440~1.338\\bin\\Hostx86\\x86\\cl.exe  /nologo /TP   /DWIN32 /D_WINDOWS /GR /EHsc  /Zi /Ob0 /Od /RTC1 -MDd /showIncludes /FoCMakeFiles\\cmTC_f39a6.dir\\CMakeCXXCompilerABI.cpp.obj /FdCMakeFiles\\cmTC_f39a6.dir\\ /FS -c C:\\Users\\Public\\Miniconda3\\Lib\\site-packages\\cmake\\data\\share\\cmake-3.31\\Modules\\CMakeCXXCompilerABI.cpp
-        [2/2] C:\\WINDOWS\\system32\\cmd.exe /C "cd . && C:\\Users\\Public\\Miniconda3\\Lib\\site-packages\\cmake\\data\\bin\\cmake.exe -E vs_link_exe --msvc-ver=1940 --intdir=CMakeFiles\\cmTC_f39a6.dir --rc=C:\\PROGRA~2\\WI3CF2~1\\10\\bin\\100226~1.0\\x86\\rc.exe --mt=C:\\PROGRA~2\\WI3CF2~1\\10\\bin\\100226~1.0\\x86\\mt.exe --manifests  -- C:\\PROGRA~2\\MICROS~2\\2022\\BUILDT~1\\VC\\Tools\\MSVC\\1440~1.338\\bin\\Hostx86\\x86\\link.exe /nologo CMakeFiles\\cmTC_f39a6.dir\\CMakeCXXCompilerABI.cpp.obj  /out:cmTC_f39a6.exe /implib:cmTC_f39a6.lib /pdb:cmTC_f39a6.pdb /version:0.0 /machine:X86  /debug /INCREMENTAL /subsystem:console  kernel32.lib user32.lib gdi32.lib winspool.lib shell32.lib ole32.lib oleaut32.lib uuid.lib comdlg32.lib advapi32.lib && cd ."
+        Run Build Command(s): C:/Users/Public/Miniconda3/Scripts/ninja.exe -v cmTC_dcbed
+        [1/2] C:\\PROGRA~2\\MICROS~2\\2022\\BUILDT~1\\VC\\Tools\\MSVC\\1440~1.338\\bin\\Hostx86\\x86\\cl.exe  /nologo /TP   /DWIN32 /D_WINDOWS /GR /EHsc  /Zi /Ob0 /Od /RTC1 -MDd /showIncludes /FoCMakeFiles\\cmTC_dcbed.dir\\CMakeCXXCompilerABI.cpp.obj /FdCMakeFiles\\cmTC_dcbed.dir\\ /FS -c C:\\Users\\Public\\Miniconda3\\Lib\\site-packages\\cmake\\data\\share\\cmake-3.31\\Modules\\CMakeCXXCompilerABI.cpp
+        [2/2] C:\\WINDOWS\\system32\\cmd.exe /C "cd . && C:\\Users\\Public\\Miniconda3\\Lib\\site-packages\\cmake\\data\\bin\\cmake.exe -E vs_link_exe --msvc-ver=1940 --intdir=CMakeFiles\\cmTC_dcbed.dir --rc=C:\\PROGRA~2\\WI3CF2~1\\10\\bin\\100226~1.0\\x86\\rc.exe --mt=C:\\PROGRA~2\\WI3CF2~1\\10\\bin\\100226~1.0\\x86\\mt.exe --manifests  -- C:\\PROGRA~2\\MICROS~2\\2022\\BUILDT~1\\VC\\Tools\\MSVC\\1440~1.338\\bin\\Hostx86\\x86\\link.exe /nologo CMakeFiles\\cmTC_dcbed.dir\\CMakeCXXCompilerABI.cpp.obj  /out:cmTC_dcbed.exe /implib:cmTC_dcbed.lib /pdb:cmTC_dcbed.pdb /version:0.0 /machine:X86  /debug /INCREMENTAL /subsystem:console  kernel32.lib user32.lib gdi32.lib winspool.lib shell32.lib ole32.lib oleaut32.lib uuid.lib comdlg32.lib advapi32.lib && cd ."
         
       exitCode: 0
   -
@@ -109,4 +109,20 @@ events:
       Running the CXX compiler's linker: "C:/PROGRA~2/MICROS~2/2022/BUILDT~1/VC/Tools/MSVC/1440~1.338/bin/Hostx86/x86/link.exe" "-v"
       Microsoft (R) Incremental Linker Version 14.40.33811.0
       Copyright (C) Microsoft Corporation.  All rights reserved.
+  -
+    kind: "message-v1"
+    backtrace:
+      - "C:/Users/Public/Miniconda3/Lib/site-packages/cmake/data/share/cmake-3.31/Modules/CMakeDetermineCompilerId.cmake:1238 (message)"
+      - "C:/Users/Public/Miniconda3/Lib/site-packages/cmake/data/share/cmake-3.31/Modules/CMakeDetermineCUDACompiler.cmake:75 (CMAKE_DETERMINE_COMPILER_ID_VENDOR)"
+      - "C:/Users/Public/Miniconda3/Lib/site-packages/torch/share/cmake/Caffe2/public/cuda.cmake:47 (enable_language)"
+      - "C:/Users/Public/Miniconda3/Lib/site-packages/torch/share/cmake/Caffe2/Caffe2Config.cmake:86 (include)"
+      - "C:/Users/Public/Miniconda3/Lib/site-packages/torch/share/cmake/Torch/TorchConfig.cmake:68 (find_package)"
+      - "CMakeLists.txt:37 (find_package)"
+    message: |
+      Checking whether the CUDA compiler is NVIDIA using "" matched "nvcc: NVIDIA \\(R\\) Cuda compiler driver":
+      nvcc: NVIDIA (R) Cuda compiler driver
+      Copyright (c) 2005-2024 NVIDIA Corporation
+      Built on Thu_Mar_28_02:30:10_Pacific_Daylight_Time_2024
+      Cuda compilation tools, release 12.4, V12.4.131
+      Build cuda_12.4.r12.4/compiler.34097967_0
 ...

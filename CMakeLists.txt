@@ -8,7 +8,11 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
   set(CMAKE_BUILD_TYPE Release)
 endif()
-add_compile_options(-Wall -Wextra)
+if(MSVC)
+  add_compile_options(/W4)
+else()
+  add_compile_options(-Wall -Wextra)
+endif()
 
 # ---- dependencies -------------------------------------------------------------------------
 # nlohmann/json reads config.json and the safetensors header. Use the system copy if there is
@@ -34,28 +38,31 @@ if(CPPVLLM_WITH_TORCH)
   set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} ${TORCH_CXX_FLAGS}")   # carries the matching C++ ABI flag
 endif()
 
+
 # ---- library ------------------------------------------------------------------------------
-file(GLOB LIB_SOURCES CONFIGURE_DEPENDS *.cpp engine/*.cpp utils/*.cpp)
-list(FILTER LIB_SOURCES EXCLUDE REGEX "/(example|bench|test)\\.cpp$")   # programs, not library code
+file(GLOB LIB_SOURCES CONFIGURE_DEPENDS *.cpp engine/*.cpp utils/*.cpp model/*.cpp)
+list(FILTER LIB_SOURCES EXCLUDE REGEX "/(example|bench|test)\\.cpp$")
 
 add_library(cppvllm STATIC ${LIB_SOURCES})
 
-# FIX: Added ${TORCH_INCLUDE_DIRS} when building with Torch
-if(CPPVLLM_WITH_TORCH)
-  target_include_directories(cppvllm PUBLIC 
-    ${CMAKE_SOURCE_DIR} 
-    ${CMAKE_SOURCE_DIR}/engine
-    ${TORCH_INCLUDE_DIRS}
-  )
-else()
-  target_include_directories(cppvllm PUBLIC ${CMAKE_SOURCE_DIR} ${CMAKE_SOURCE_DIR}/engine)
-endif()
+target_include_directories(cppvllm PUBLIC
+  ${CMAKE_SOURCE_DIR}
+  ${CMAKE_SOURCE_DIR}/engine
+  ${CMAKE_SOURCE_DIR}/model
+  ${TORCH_INCLUDE_DIRS}
+)
 
 target_link_libraries(cppvllm PUBLIC nlohmann_json::nlohmann_json)
+
 if(CPPVLLM_WITH_TORCH)
   target_link_libraries(cppvllm PUBLIC ${TORCH_LIBRARIES})
-endif()
 
+  # model_runner.cpp calls cudaMemGetInfo directly, so link the CUDA runtime explicitly.
+  find_package(CUDAToolkit QUIET)
+  if(CUDAToolkit_FOUND)
+    target_link_libraries(cppvllm PUBLIC CUDA::cudart)
+  endif()
+endif()
 # ---- programs -----------------------------------------------------------------------------
 foreach(app example bench)
   if(EXISTS ${CMAKE_SOURCE_DIR}/${app}.cpp)
