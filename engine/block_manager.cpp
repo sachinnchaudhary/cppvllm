@@ -55,7 +55,6 @@ void BlockManager::unlink_free(int32_t id) {
 
 //LRF(least recently freed) block. 
 int32_t BlockManager::take_fresh_block() {
-   assert(free_head_ != -1 && "out of KV blocks: must check can_allocate/can_append");
    const int32_t id = free_head_;
    unlink_free(id);
 

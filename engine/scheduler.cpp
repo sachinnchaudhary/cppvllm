@@ -7,8 +7,6 @@
 
 Scheduler::Scheduler(const SchedulerConfig& cfg, int32_t num_kv_blocks)
     : cfg_(cfg), bm_(num_kv_blocks) {
-    if (cfg_.max_num_batched_tokens == 0 || cfg_.max_num_seqs == 0)
-        throw std::invalid_argument("Scheduler: max_num_batched_tokens and max_num_seqs must be > 0");
     batch_.seqs.reserve(cfg_.max_num_seqs);
 }
 
@@ -19,8 +17,7 @@ bool Scheduler::is_eos(int32_t t) const {
 }
 
 void Scheduler::add_request(Sequence* seq) {
-    // A sequence that cannot fit in the whole cache even when running alone would be preempted
-    // forever, so reject it up front.
+    // A sequence that cannot fit in the whole cache even when running alone would be preempted forever, so reject it up front.
     const size_t max_len = seq->num_prompt_tokens + static_cast<size_t>(std::max(seq->params.max_tokens, 0));
     const size_t blocks = (max_len + Sequence::BLOCK_SIZE - 1) / Sequence::BLOCK_SIZE;
     if (blocks > static_cast<size_t>(bm_.num_blocks()))

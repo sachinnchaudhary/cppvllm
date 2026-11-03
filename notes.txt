@@ -35,3 +35,5 @@ cppvllm/
     tokenizer.cpp                       
   bench.cpp
   example.cpp
+
+paged-attention kernel, CUDA graphs, sync-free sampling, radix cache with cache-aware scheduling, tensor parallelism, MoE, then full overlap scheduling.

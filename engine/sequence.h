@@ -42,7 +42,6 @@ struct Sequence {
        params(p),
        token_ids(prompt.begin(), prompt.end()),  
        num_prompt_tokens(static_cast<uint32_t>(prompt.size())) {  
-        assert(!prompt.empty());  
         token_ids.reserve(num_prompt_tokens + params.max_tokens);  
         block_table.reserve((num_prompt_tokens + params.max_tokens + BLOCK_SIZE - 1) / BLOCK_SIZE);
        } 

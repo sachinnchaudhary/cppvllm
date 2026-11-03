@@ -20,9 +20,12 @@ struct FlatBatch {
     int64_t max_kv = 0;
 };
 
-class Llama {
+// Qwen3 dense decoder (HF weight names). Per layer:
+//   x = rmsnorm(h);  q,k,v = projections;  q = rmsnorm_per_head(q), k = rmsnorm_per_head(k)   <- Qwen3's QK-norm
+//   rope(q), rope(k);  paged attention;  h += o_proj(attn);  h += down(silu(gate(x)) * up(x))
+class Qwen3 {
 public:
-    explicit Llama(const ModelConfig& cfg);
+    explicit Qwen3(const ModelConfig& cfg);
 
     void load_weights(const WeightMap& w);
     // k, v: [n_layers, num_blocks, block_size, n_kv_heads, head_dim]
@@ -31,12 +34,16 @@ public:
     // Returns fp32 logits [S, V], or [R, V] if sample_rows (indices into the S sequences) is given.
     torch::Tensor forward(const FlatBatch& b, const torch::Tensor& sample_rows = torch::Tensor());
 
+    // true when attention runs through the fused paged-attention kernel (CUDA build, supported shapes)
+    [[nodiscard]] bool fused_attention() const;
+
     [[nodiscard]] int64_t block_size() const { return block_size_; }
     [[nodiscard]] const ModelConfig& config() const { return cfg_; }
 
 private:
     struct Layer {
         torch::Tensor wq, wk, wv, wo;
+        torch::Tensor q_norm, k_norm;          // [head_dim] weights of the per-head RMSNorms
         torch::Tensor gate, up, down;
         torch::Tensor attn_norm, ffn_norm;
     };

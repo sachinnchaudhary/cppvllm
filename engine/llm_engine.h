@@ -30,6 +30,7 @@ struct EngineStats {
     [[nodiscard]] double generated_per_second() const { return seconds > 0 ? static_cast<double>(tokens_generated) / seconds : 0; }
 };
 
+
 class LLMEngine {
 public:
     explicit LLMEngine(const EngineConfig& cfg, std::optional<torch::Device> device = std::nullopt);

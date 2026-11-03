@@ -6,34 +6,39 @@
 #include <string>
 
 namespace {
+
 torch::Device pick_device(const std::optional<torch::Device>& d) {
     if (d) return *d;
     return torch::cuda::is_available() ? torch::Device(torch::kCUDA, 0) : torch::Device(torch::kCPU);
 }
 
 SchedulerConfig make_scheduler_config(const EngineConfig& e, const ModelConfig& m) {
-    SchedulerConfig s = e.scheduler_config();
+    SchedulerConfig s;
+    s.max_num_batched_tokens = e.max_num_batched_tokens;
+    s.max_num_seqs           = e.max_num_seqs;
+    s.max_chunk_tokens       = e.max_chunk_tokens;
     if (!m.eos_token_ids.empty()) {
         s.eos_token_id = m.eos_token_ids.front();
         s.extra_eos_token_ids.assign(m.eos_token_ids.begin() + 1, m.eos_token_ids.end());
     }
     return s;
 }
+
 }  // namespace
 
 LLMEngine::LLMEngine(const EngineConfig& cfg, std::optional<torch::Device> device)
     : cfg_(cfg),
       mcfg_(ModelConfig::from_hf_json(cfg.model_path + "/config.json")),
       runner_(cfg_, mcfg_, pick_device(device)),
-      scheduler_(make_scheduler_config(cfg_, mcfg_), runner_.num_kv_blocks()) {}
+      scheduler_(make_scheduler_config(cfg_, mcfg_), runner_.num_kv_blocks()) {
+    cfg_.validate();
+}
 
 bool LLMEngine::is_eos(int32_t t) const {
     return std::find(mcfg_.eos_token_ids.begin(), mcfg_.eos_token_ids.end(), t) != mcfg_.eos_token_ids.end();
 }
 
 uint64_t LLMEngine::add_request(std::span<const int32_t> prompt, const SamplingParams& p) {
-    if (prompt.empty()) throw std::invalid_argument("add_request: empty prompt");
-    if (p.max_tokens <= 0) throw std::invalid_argument("add_request: max_tokens must be > 0");
     const uint64_t id = next_id_++;
     auto seq = std::make_unique<Sequence>(id, prompt, p);
     scheduler_.add_request(seq.get());      // may throw; seq is simply dropped
@@ -44,10 +49,11 @@ uint64_t LLMEngine::add_request(std::span<const int32_t> prompt, const SamplingP
 StepInfo LLMEngine::step() {
     StepInfo info;
     if (scheduler_.is_finished()) return info;
-    const auto t0 = std::chrono::steady_clock::now();
 
+    const auto t0 = std::chrono::steady_clock::now();
     const ScheduledBatch& batch = scheduler_.schedule();
     if (batch.empty()) throw std::logic_error("scheduler produced an empty batch while requests are pending");
+
     const std::vector<int32_t>& sampled = runner_.run(batch);
     scheduler_.postprocess(batch, sampled);
 
