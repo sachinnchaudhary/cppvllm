@@ -1,6 +1,3 @@
 .vscode/
 __pycache__/
 build/
-modal_test.py
-notes.txt
-test_all.py
