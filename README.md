@@ -14,8 +14,8 @@ cppvllm(FP8) is 1.69x faster than Nano-Vllm and 1.61x faster than Vllm.
 - Model: Qwen3-0.6B
 - GPU: single A10G GPU
 - Requests: 256 sequences
-- Input length: random_sample(100–1024 tokens)
-- Output length: random_sample(100–1024 tokens)
+- Input length: random_sample(100-1024 tokens)
+- Output length: random_sample(100-1024 tokens)
 - File: `bench.cpp`
 
 **BENCHMARK COMPARISON (Qwen/Qwen3-0.6B | 256 Seqs | GPU: A10G)**
