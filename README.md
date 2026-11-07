@@ -74,7 +74,7 @@ sudo apt-get install -y build-essential cmake ninja-build git pkg-config \
 pip install torch==2.5.1 "huggingface_hub[cli]"
 
 # get the code and the model
-git clone <repo-url> cppvllm
+git clone https://github.com/sachinnchaudhary/cppvllm
 cd cppvllm
 huggingface-cli download Qwen/Qwen3-0.6B --local-dir models/qwen3-0.6b
 
