@@ -11,20 +11,21 @@
 struct SchedulerConfig {
     size_t  max_num_batched_tokens = 2048;
     size_t  max_num_seqs = 128;
-    size_t  max_chunk_tokens = 0;              // 0 = no per-sequence chunk cap
+    size_t  max_chunk_tokens = 0;             
     int32_t eos_token_id = -1;
-    std::vector<int32_t> extra_eos_token_ids;  // models with several EOS ids
+    std::vector<int32_t> extra_eos_token_ids;  
 };
 
 struct ScheduledBatch {
     std::vector<Sequence*> seqs;
+    std::vector<int64_t> sample_pos;          
+                                              
     size_t total_tokens = 0;
-    bool all_single_token = false;             // pure decode, for CUDA graphs later
-
+    bool all_single_token = false;            
+    bool blocked = false;                     
     [[nodiscard]] bool empty() const noexcept { return seqs.empty(); }
 };
 
-// True when this step processes the last uncached token, so logits get sampled.
 [[nodiscard]] inline bool samples_this_step(const Sequence& s) noexcept {
     return s.num_cached_tokens + s.num_scheduled_tokens == s.size();
 }
@@ -34,9 +35,11 @@ public:
     Scheduler(const SchedulerConfig& cfg, int32_t num_kv_blocks);
 
     void add_request(Sequence* seq);
-    [[nodiscard]] const ScheduledBatch& schedule();
-    // sampled[i] belongs to batch.seqs[i]; -1 means "no token sampled" (mid-prefill chunk)
-    void postprocess(const ScheduledBatch& batch, std::span<const int32_t> sampled);
+
+    void schedule(ScheduledBatch& out, bool allow_preempt);
+    void on_launched(ScheduledBatch& batch);
+   
+    size_t postprocess(const ScheduledBatch& batch, std::span<const int32_t> sampled);
 
     [[nodiscard]] bool is_finished() const noexcept { return waiting_.empty() && running_.empty(); }
     [[nodiscard]] size_t num_waiting() const noexcept { return waiting_.size(); }
@@ -51,8 +54,7 @@ private:
     SchedulerConfig cfg_;
     BlockManager bm_;
     std::deque<Sequence*> waiting_;
-    std::vector<Sequence*> running_;   // admission order = priority order (oldest first)
+    std::vector<Sequence*> running_;   
 
-    ScheduledBatch batch_;
     size_t num_preemptions_ = 0;
 };

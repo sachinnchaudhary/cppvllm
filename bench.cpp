@@ -10,6 +10,8 @@
 int main(int argc, char** argv) {
     if (argc < 2) { std::cerr << "usage: bench <model_dir>\n"; return 2; }
 
+    const int tp_size = 1;   
+
     std::mt19937 gen(0);
     auto randint = [&](int lo, int hi) { return std::uniform_int_distribution<int>(lo, hi)(gen); };
     const int num_seqs = 256;
@@ -18,9 +20,10 @@ int main(int argc, char** argv) {
 
     EngineConfig cfg;
     cfg.model_path = argv[1];
+    cfg.tensor_parallel_size = tp_size;
     cfg.enforce_eager = false;
     cfg.max_num_batched_tokens = 4096;
-    cfg.gpu_memory_utilization = 0.85f;     // keeps the worst-case warmup forward (naive O(T^2) attention) small
+    cfg.gpu_memory_utilization = 0.80f;     
     LLMEngine llm(cfg);
 
     std::vector<std::vector<int32_t>> prompt_token_ids;

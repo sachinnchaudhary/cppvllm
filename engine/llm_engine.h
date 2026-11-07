@@ -1,9 +1,10 @@
 #pragma once
 #include "config.h"
-#include "model_runner.h"
+#include "model/tp.h"
 #include "scheduler.h"
 #include "sequence.h"
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
@@ -18,11 +19,10 @@ struct GenerationOutput {
     std::vector<int32_t> token_ids;
     bool stopped_on_eos = false;
 };
-
 struct StepInfo {
-    size_t num_seqs = 0, num_tokens = 0, num_sampled = 0, num_finished = 0;
+    size_t num_seqs = 0, num_tokens = 0;     
+    size_t num_sampled = 0, num_finished = 0;   
 };
-
 struct EngineStats {
     size_t steps = 0, tokens_processed = 0, tokens_generated = 0;
     size_t preemptions = 0;
@@ -37,7 +37,8 @@ public:
 
     uint64_t add_request(std::span<const int32_t> prompt, const SamplingParams& params);
     StepInfo step();
-    [[nodiscard]] bool is_finished() const noexcept { return scheduler_.is_finished(); }
+    void sync();                                            
+    [[nodiscard]] bool is_finished() const noexcept { return count_ == 0 && scheduler_.is_finished(); }
 
     std::vector<GenerationOutput> generate(const std::vector<std::vector<int32_t>>& prompts, const SamplingParams& params);
     std::vector<GenerationOutput> take_finished();
@@ -47,13 +48,19 @@ public:
     [[nodiscard]] int32_t num_kv_blocks() const noexcept { return runner_.num_kv_blocks(); }
 
 private:
+    static constexpr int kDepth = 2;                        
+
     void harvest(Sequence& s);
+    void retire_oldest(StepInfo& info);
     [[nodiscard]] bool is_eos(int32_t t) const;
 
     EngineConfig cfg_;
     ModelConfig mcfg_;
-    ModelRunner runner_;
+    TPGroup runner_;
     Scheduler scheduler_;
+
+    std::array<ScheduledBatch, kDepth> ring_;             
+    int head_ = 0, count_ = 0;
 
     std::unordered_map<uint64_t, std::unique_ptr<Sequence>> live_;
     std::unordered_map<uint64_t, GenerationOutput> finished_;

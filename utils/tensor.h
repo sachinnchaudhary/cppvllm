@@ -2,7 +2,7 @@
 #include "utils/safetensors.h"
 
 #include <torch/torch.h>
-
+#include <vector>  
 #include <cstdint>
 #include <optional>
 #include <span>
@@ -24,15 +24,14 @@
         case STDType::BF16: return at::kBFloat16;
         case STDType::F32:  return at::kFloat;
         case STDType::F64:  return at::kDouble;
-        default: throw std::runtime_error("tensor.h: unsupported safetensors dtype");
+        default:
+            throw std::invalid_argument("Unsupported STDType");
     }
 }
 
-// Zero-copy CPU view into the mmap'd file. Valid only while `f` is alive.
 [[nodiscard]] inline torch::Tensor tensor_view(const SafeTensorsFile& f, const TensorInfo& ti) {
     const auto options = torch::TensorOptions().dtype(to_torch_dtype(ti.dtype)).device(torch::kCPU);
     if (ti.numel() == 0) return torch::empty(ti.shape, options);
-    // data() returns const std::byte*; from_blob wants void*
     void* p = const_cast<void*>(static_cast<const void*>(f.data(ti)));
     return torch::from_blob(p, ti.shape, options);
 }
@@ -43,7 +42,7 @@
     const torch::Tensor src = tensor_view(f, ti);
     at::ScalarType target = src.scalar_type();
     if (dtype.has_value() && at::isFloatingType(src.scalar_type())) target = *dtype;
-    return src.to(device, target, /*non_blocking=*/false, /*copy=*/true);   // copy: result must outlive the mmap
+    return src.to(device, target, /*non_blocking=*/false, /*copy=*/true);   
 }
 
 using WeightMap = std::unordered_map<std::string, torch::Tensor>;
@@ -64,14 +63,17 @@ using WeightMap = std::unordered_map<std::string, torch::Tensor>;
 
 template <typename T>
 class StagedBuffer {
-    static_assert(std::is_trivially_copyable_v<T>, "StagedBuffer holds plain numbers");
 public:
+    static constexpr int kSlots = 4;   // host ring size; ModelRunner uses the same number for its events
+
     StagedBuffer(int64_t capacity, torch::Device device, T fill_value = T{}) : capacity_(capacity) {
-        TORCH_CHECK(capacity > 0, "StagedBuffer: capacity must be positive");
         const auto scalar = c10::CppTypeToScalarType<T>::value;
-        host_ = torch::empty({capacity}, torch::TensorOptions().dtype(scalar).pinned_memory(device.is_cuda()));
+        hosts_.reserve(kSlots);
+        for (int s = 0; s < kSlots; ++s) {
+            hosts_.push_back(torch::empty({capacity}, torch::TensorOptions().dtype(scalar).pinned_memory(device.is_cuda())));
+            hosts_.back().fill_(fill_value);
+        }
         dev_ = torch::empty({capacity}, torch::TensorOptions().dtype(scalar).device(device));
-        host_.fill_(fill_value);
         dev_.fill_(fill_value);
     }
 
@@ -82,19 +84,20 @@ public:
 
     [[nodiscard]] int64_t capacity() const noexcept { return capacity_; }
 
+    // Which pinned host buffer host() and upload() use. The device buffer is the same for every slot.
+    void select_slot(int s) noexcept { slot_ = s % kSlots; }
+
     [[nodiscard]] std::span<T> host() noexcept {
-        return std::span<T>(host_.data_ptr<T>(), static_cast<size_t>(capacity_));
+        return std::span<T>(hosts_[slot_].data_ptr<T>(), static_cast<size_t>(capacity_));
     }
 
     torch::Tensor upload(int64_t n) {
-        TORCH_CHECK(n >= 0 && n <= capacity_, "StagedBuffer::upload: n= ", n, " exceeds capacity ", capacity_);
         torch::Tensor dst = dev_.narrow(0, 0, n);
-        if (n > 0) dst.copy_(host_.narrow(0, 0, n), /*non_blocking=*/true);
+        if (n > 0) dst.copy_(hosts_[slot_].narrow(0, 0, n), /*non_blocking=*/true);
         return dst;
     }
 
     [[nodiscard]] torch::Tensor device_view(int64_t n) const {
-        TORCH_CHECK(n >= 0 && n <= capacity_, "StagedBuffer::device_view: n= ", n, " exceeds capacity ", capacity_);
         return dev_.narrow(0, 0, n);
     }
 
@@ -102,6 +105,7 @@ public:
 
 private:
     int64_t capacity_ = 0;
-    torch::Tensor host_;
+    int slot_ = 0;
+    std::vector<torch::Tensor> hosts_;
     torch::Tensor dev_;
 };

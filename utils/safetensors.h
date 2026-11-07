@@ -55,5 +55,4 @@ private:
     std::unordered_map<std::string, size_t, StringHash, std::equal_to<>> index_;
 };
 
-// A single .safetensors file, or every *.safetensors in a directory (sorted).
 [[nodiscard]] std::vector<std::string> list_safetensors_files(const std::string& path);

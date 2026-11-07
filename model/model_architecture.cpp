@@ -1,12 +1,24 @@
 #include "model_architecture.h"
-
 #include <cmath>
-
-#ifdef CPPVLLM_HAS_CUDA_KERNELS
+#include <optional>
+#include "kernels/fused_ops.h"
 #include "kernels/paged_attention.h"
-#endif
+#include "namespace_config.h"
 
-using torch::indexing::Slice;
+#include <c10/cuda/CUDAStream.h>
+#include <cuda_runtime_api.h>
+
+// vllm-flash-attn (FlashAttention-2)
+
+namespace FLASH_NAMESPACE {
+std::vector<at::Tensor> mha_varlen_fwd(
+    at::Tensor& q, const at::Tensor& k, const at::Tensor& v, std::optional<at::Tensor>& out_,
+    const at::Tensor& cu_seqlens_q, const at::Tensor& cu_seqlens_k, std::optional<at::Tensor>& seqused_k,
+    std::optional<const at::Tensor>& leftpad_k_, std::optional<at::Tensor>& block_table_,
+    std::optional<at::Tensor>& alibi_slopes_, int max_seqlen_q, const int max_seqlen_k, const float p_dropout,
+    const float softmax_scale, const bool zero_tensors, bool is_causal, int window_size_left, int window_size_right,
+    const float softcap, const bool return_softmax, std::optional<at::Generator> gen_);
+}
 
 namespace {
 
@@ -16,192 +28,209 @@ torch::Tensor rms_norm(const torch::Tensor& x, const torch::Tensor& w, double ep
     return xf.to(x.scalar_type()) * w;
 }
 
-torch::Tensor rope(const torch::Tensor& t, const torch::Tensor& cos, const torch::Tensor& sin, int64_t half) {
-    torch::Tensor tf = t.to(torch::kFloat);
-    torch::Tensor x1 = tf.narrow(-1, 0, half);
-    torch::Tensor x2 = tf.narrow(-1, half, half);
-    return torch::cat({x1 * cos - x2 * sin, x2 * cos + x1 * sin}, -1).to(t.scalar_type());
+torch::Tensor shard_rows(const torch::Tensor& weight, int rank, int world_size) {
+    if (world_size == 1) return weight;
+    const int64_t rows_per_rank = weight.size(0) / world_size;
+    return weight.narrow(0, rank * rows_per_rank, rows_per_rank).contiguous();
 }
 
-torch::Tensor take(const WeightMap& w, const std::string& name, std::vector<int64_t> shape) {
-    auto it = w.find(name);
-    TORCH_CHECK(it != w.end(), "missing weight '", name, "'");
-    TORCH_CHECK(it->second.sizes() == c10::IntArrayRef(shape),
-                "weight '", name, "' has shape ", it->second.sizes(),
-                " but the config expects ", c10::IntArrayRef(shape));
-    return it->second;
+torch::Tensor shard_cols(const torch::Tensor& weight, int rank, int world_size) {
+    if (world_size == 1) return weight;
+    const int64_t cols_per_rank = weight.size(1) / world_size;
+    return weight.narrow(1, rank * cols_per_rank, cols_per_rank).contiguous();
 }
 
-}  // namespace
+torch::Tensor flash_attention_dense(torch::Tensor& q, const torch::Tensor& k, const torch::Tensor& v,
+                                    const torch::Tensor& cu_q, int64_t max_q, float scale) {
+    std::optional<at::Tensor> out, seqused_k, bt, alibi;
+    std::optional<const at::Tensor> leftpad_k;
+    auto res = FLASH_NAMESPACE::mha_varlen_fwd(
+        q, k, v, out, cu_q, cu_q, seqused_k, leftpad_k, bt, alibi,
+        static_cast<int>(max_q), static_cast<int>(max_q),
+        /*p_dropout=*/0.f, scale, /*zero_tensors=*/false, /*is_causal=*/true,
+        /*window_size_left=*/-1, /*window_size_right=*/-1, /*softcap=*/0.f, /*return_softmax=*/false,
+        /*gen_=*/std::nullopt);
+    return res[0];
+}
 
-Qwen3::Qwen3(const ModelConfig& cfg) : cfg_(cfg) {
+} 
+
+Qwen3::Qwen3(const ModelConfig& cfg, int tp_rank, int tp_size, ncclComm_t comm)
+    : global_cfg_(cfg), cfg_(cfg), tp_rank_(tp_rank), tp_size_(tp_size), head_dim_(cfg.head_dim()), comm_(comm) {
+    cfg_.n_heads /= tp_size_;
+    cfg_.n_kv_heads /= tp_size_;
+    cfg_.intermediate_size /= tp_size_;
+
     build_rope_tables();
 }
 
-// Plain RoPE (Qwen3 has no frequency scaling): pair i rotates by position * theta^(-2i/head_dim).
 void Qwen3::build_rope_tables() {
-    const int64_t hd = cfg_.head_dim();
+    const int64_t hd = head_dim_;
     const auto f64 = torch::TensorOptions().dtype(torch::kDouble);
-
     torch::Tensor idx = torch::arange(0, hd, 2, f64);
     torch::Tensor freqs = torch::pow(static_cast<double>(cfg_.rope_theta), idx / static_cast<double>(hd)).reciprocal();
-
-    torch::Tensor angle = torch::outer(torch::arange(cfg_.max_seq_len, f64), freqs);   // [max_seq_len, hd/2]
+    torch::Tensor angle = torch::outer(torch::arange(cfg_.max_seq_len, f64), freqs);  // [max_seq_len, hd/2]
     cos_ = angle.cos().to(torch::kFloat);
     sin_ = angle.sin().to(torch::kFloat);
 }
 
-void Qwen3::load_weights(const WeightMap& w) {
-    const int64_t D = cfg_.dim, H = cfg_.n_heads, KV = cfg_.n_kv_heads, hd = cfg_.head_dim(),
-                  I = cfg_.intermediate_size, V = cfg_.vocab_size;
-
-    embed_ = take(w, "model.embed_tokens.weight", {V, D});
-    final_norm_ = take(w, "model.norm.weight", {D});
-    if (w.count("lm_head.weight")) lm_head_ = take(w, "lm_head.weight", {V, D});
-    else if (cfg_.tie_word_embeddings) lm_head_ = embed_;
-    else TORCH_CHECK(false, "no lm_head.weight in the file and tie_word_embeddings is false");
+void Qwen3::load_weights(const WeightMap& w, torch::Device target_device) {
+    const torch::Tensor& full_embed = w.at("model.embed_tokens.weight");
+    embed_ = full_embed.to(target_device);
+    final_norm_ = w.at("model.norm.weight").to(target_device);
+    if (cfg_.tie_word_embeddings) {
+        const int64_t vl = global_cfg_.vocab_size / tp_size_;
+        lm_head_ = embed_.narrow(0, static_cast<int64_t>(tp_rank_) * vl, vl);
+    } else {
+        lm_head_ = shard_rows(w.at("lm_head.weight"), tp_rank_, tp_size_).to(target_device);
+    }
 
     layers_.clear();
-    layers_.reserve(cfg_.n_layers);
-    for (int32_t i = 0; i < cfg_.n_layers; ++i) {
+    layers_.reserve(global_cfg_.n_layers);
+    for (int32_t i = 0; i < global_cfg_.n_layers; ++i) {
         const std::string p = "model.layers." + std::to_string(i) + ".";
+        const torch::Tensor& q_weight = w.at(p + "self_attn.q_proj.weight");
+        const torch::Tensor& k_weight = w.at(p + "self_attn.k_proj.weight");
+        const torch::Tensor& v_weight = w.at(p + "self_attn.v_proj.weight");
         Layer L;
-        L.wq        = take(w, p + "self_attn.q_proj.weight", {H * hd, D});
-        L.wk        = take(w, p + "self_attn.k_proj.weight", {KV * hd, D});
-        L.wv        = take(w, p + "self_attn.v_proj.weight", {KV * hd, D});
-        L.wo        = take(w, p + "self_attn.o_proj.weight", {D, H * hd});
-        L.q_norm    = take(w, p + "self_attn.q_norm.weight", {hd});     // Qwen3's QK-norm weights
-        L.k_norm    = take(w, p + "self_attn.k_norm.weight", {hd});
-        L.gate      = take(w, p + "mlp.gate_proj.weight", {I, D});
-        L.up        = take(w, p + "mlp.up_proj.weight", {I, D});
-        L.down      = take(w, p + "mlp.down_proj.weight", {D, I});
-        L.attn_norm = take(w, p + "input_layernorm.weight", {D});
-        L.ffn_norm  = take(w, p + "post_attention_layernorm.weight", {D});
-        TORCH_CHECK(L.wq.device() == embed_.device() && L.wq.scalar_type() == embed_.scalar_type(),
-                    "all weights must share one device and dtype (layer ", i, ")");
+        
+        L.wqkv = torch::cat({shard_rows(q_weight, tp_rank_, tp_size_),
+                             shard_rows(k_weight, tp_rank_, tp_size_),
+                             shard_rows(v_weight, tp_rank_, tp_size_)}, 0).to(target_device);
+        const torch::Tensor& wo_weight = w.at(p + "self_attn.o_proj.weight");
+        L.wo = shard_cols(wo_weight, tp_rank_, tp_size_).to(target_device);
+
+        L.q_norm = w.at(p + "self_attn.q_norm.weight").to(target_device);
+        L.k_norm = w.at(p + "self_attn.k_norm.weight").to(target_device);
+
+        const torch::Tensor& gate_weight = w.at(p + "mlp.gate_proj.weight");
+        const torch::Tensor& up_weight = w.at(p + "mlp.up_proj.weight");
+        L.w_gate_up = torch::cat({shard_rows(gate_weight, tp_rank_, tp_size_),
+                                  shard_rows(up_weight, tp_rank_, tp_size_)}, 0).to(target_device);
+
+        const torch::Tensor& down_weight = w.at(p + "mlp.down_proj.weight");
+        L.down = shard_cols(down_weight, tp_rank_, tp_size_).to(target_device);
+        L.attn_norm = w.at(p + "input_layernorm.weight").to(target_device);
+        L.ffn_norm = w.at(p + "post_attention_layernorm.weight").to(target_device);
         layers_.push_back(std::move(L));
     }
-    cos_ = cos_.to(embed_.device());
-    sin_ = sin_.to(embed_.device());
-    loaded_ = true;
+
+    cos_ = cos_.to(target_device);
+    sin_ = sin_.to(target_device);
 }
 
-void Qwen3::bind_kv_cache(torch::Tensor k, torch::Tensor v) {
-    TORCH_CHECK(loaded_, "call load_weights() before bind_kv_cache()");
-    TORCH_CHECK(k.dim() == 5 && k.sizes() == v.sizes(), "KV cache must be [layers, blocks, block_size, kv_heads, head_dim]");
-    TORCH_CHECK(k.size(0) == cfg_.n_layers && k.size(3) == cfg_.n_kv_heads && k.size(4) == cfg_.head_dim(),
-                "KV cache shape does not match the model config");
-    TORCH_CHECK(k.scalar_type() == embed_.scalar_type() && v.scalar_type() == embed_.scalar_type() &&
-                k.device() == embed_.device() && v.device() == embed_.device(),
-                "KV cache must have the dtype and device of the weights");
-    TORCH_CHECK(k.is_contiguous() && v.is_contiguous(), "KV cache must be contiguous");
+void Qwen3::bind_kv_cache(torch::Tensor k, torch::Tensor v, torch::Tensor k_scale, torch::Tensor v_scale) {
     k_cache_ = std::move(k);
     v_cache_ = std::move(v);
+    k_scale_ = std::move(k_scale);
+    v_scale_ = std::move(v_scale);
     block_size_ = k_cache_.size(2);
 }
 
-bool Qwen3::fused_attention() const {
-#ifdef CPPVLLM_HAS_CUDA_KERNELS
-    const int64_t hd = cfg_.head_dim(), rep = cfg_.n_heads / cfg_.n_kv_heads;
-    return loaded_ && embed_.is_cuda() && (hd == 64 || hd == 128) &&
-           (rep == 1 || rep == 2 || rep == 4 || rep == 8);
-#else
-    return false;
-#endif
+torch::Tensor Qwen3::forward_backbone(const FlatBatch& b) {
+    torch::NoGradGuard no_grad;
+    const int64_t T = b.tokens.size(0), S = b.kv_lens.size(0), BS = block_size_;
+    const int64_t H = cfg_.n_heads, KV = cfg_.n_kv_heads, hd = head_dim_, I = cfg_.intermediate_size;
+    const float scale = 1.0f / std::sqrt(static_cast<float>(hd));
+    const auto i64 = torch::TensorOptions().dtype(torch::kLong).device(b.tokens.device());
+
+    torch::Tensor tpos = torch::arange(T, i64);
+    torch::Tensor ends = b.cu_seqlens_q.slice(0, 1, S + 1).contiguous();
+    torch::Tensor seq_idx = torch::searchsorted(ends, tpos, /*out_int32=*/false, /*right=*/true);
+    torch::Tensor blk = b.block_tables.index({seq_idx, torch::div(b.positions, BS, "floor")});
+    torch::Tensor slot = blk * BS + b.positions.remainder(BS);
+
+    const bool dense_flash = b.max_q > 1 && b.total_kv == T;
+
+    torch::Tensor cu_q32, token_kv_len;
+    if (dense_flash) cu_q32 = b.cu_seqlens_q.to(torch::kInt).contiguous();
+    else             token_kv_len = b.positions + 1;
+
+    torch::Tensor h = embed_.index_select(0, b.tokens);
+    torch::Tensor x = torch::empty_like(h);
+    fused::rms_norm(x, h, layers_[0].attn_norm, cfg_.norm_eps);
+
+    for (int32_t l = 0; l < cfg_.n_layers; ++l) {
+        const Layer& L = layers_[l];
+        torch::Tensor qkv = at::linear(x, L.wqkv);
+        torch::Tensor q = torch::empty({T, H, hd}, h.options());
+
+        torch::Tensor k8 = k_cache_.select(0, l).view({-1, KV, hd});
+        torch::Tensor v8 = v_cache_.select(0, l).view({-1, KV, hd});
+        torch::Tensor ks = k_scale_.select(0, l).view({-1, KV});
+        torch::Tensor vs = v_scale_.select(0, l).view({-1, KV});
+        torch::Tensor k_dense, v_dense;
+        if (dense_flash) {
+            k_dense = torch::empty({T, KV, hd}, h.options());
+            v_dense = torch::empty({T, KV, hd}, h.options());
+        }
+        fused::qk_norm_rope_kv_write_fp8(q, qkv, L.q_norm, L.k_norm, cos_, sin_, b.positions, slot, k8, v8, ks, vs,
+                                         k_dense, v_dense, H, KV, cfg_.norm_eps);
+
+        torch::Tensor att;
+        if (dense_flash) {
+            att = flash_attention_dense(q, k_dense, v_dense, cu_q32, b.max_q, scale);
+        } else {
+            att = torch::empty_like(q);
+            paged_attention_fp8(att, q, k_cache_.select(0, l), v_cache_.select(0, l), k_scale_.select(0, l),
+                                v_scale_.select(0, l), b.block_tables, seq_idx, token_kv_len, scale);
+        }
+        torch::Tensor attn_out = at::linear(att.view({T, H * hd}), L.wo);
+        all_reduce_in_place(attn_out);
+        fused::add_rms_norm(h, attn_out, L.ffn_norm, x, cfg_.norm_eps);
+
+        torch::Tensor gu = at::linear(x, L.w_gate_up);
+        torch::Tensor act = torch::empty({T, I}, h.options());
+        fused::swiglu(act, gu);
+        torch::Tensor mlp = at::linear(act, L.down);
+        all_reduce_in_place(mlp);
+        if (l + 1 < cfg_.n_layers) fused::add_rms_norm(h, mlp, layers_[l + 1].attn_norm, x, cfg_.norm_eps);
+        else h.add_(mlp);
+    }
+    return h;
+}
+
+void Qwen3::all_reduce_in_place(torch::Tensor& tensor) const {
+    if (tp_size_ == 1) return;
+    const auto stream = c10::cuda::getCurrentCUDAStream(tensor.get_device()).stream();
+    ncclAllReduce(tensor.data_ptr(), tensor.data_ptr(),
+                            static_cast<size_t>(tensor.numel()), ncclBfloat16,
+                            ncclSum, comm_, stream);
+}
+
+torch::Tensor Qwen3::all_gather_vocab(const torch::Tensor& local_logits) const {
+    if (tp_size_ == 1) return local_logits;
+    const int64_t rows = local_logits.size(0);
+    const int64_t local_vocab = local_logits.size(1);
+    torch::Tensor gathered = torch::empty({tp_size_, rows, local_vocab}, local_logits.options());
+    const auto stream = c10::cuda::getCurrentCUDAStream(local_logits.get_device()).stream();
+    ncclAllGather(local_logits.data_ptr(), gathered.data_ptr(),
+                            static_cast<size_t>(local_logits.numel()), ncclFloat32,
+                            comm_, stream);
+
+    return gathered.permute({1, 0, 2}).contiguous().view({rows, global_cfg_.vocab_size});
+}
+
+void Qwen3::broadcast_samples(torch::Tensor& samples) const {
+    if (tp_size_ == 1 || samples.numel() == 0) return;
+    const auto stream = c10::cuda::getCurrentCUDAStream(samples.get_device()).stream();
+    ncclBroadcast(samples.data_ptr(), samples.data_ptr(),
+                            static_cast<size_t>(samples.numel()), ncclInt64,
+                            /*root=*/0, comm_, stream);
+}
+
+torch::Tensor Qwen3::compute_logits(const torch::Tensor& h) {
+    torch::NoGradGuard no_grad;
+    torch::Tensor local = at::linear(rms_norm(h, final_norm_, cfg_.norm_eps), lm_head_).to(torch::kFloat).contiguous();
+    return all_gather_vocab(local);
 }
 
 torch::Tensor Qwen3::forward(const FlatBatch& b, const torch::Tensor& sample_rows) {
     torch::NoGradGuard no_grad;
-
-    const int64_t T = b.tokens.size(0), S = b.kv_lens.size(0), BS = block_size_;
-    const int64_t H = cfg_.n_heads, KV = cfg_.n_kv_heads, hd = cfg_.head_dim(), half = hd / 2, rep = H / KV;
-    const int64_t max_q = b.max_q, max_kv = b.max_kv;
-    const bool fused = fused_attention();
-    const double scale = 1.0 / std::sqrt(static_cast<double>(hd));
-
-    const auto dev = b.tokens.device();
-    const auto i64 = torch::TensorOptions().dtype(torch::kLong).device(dev);
-
-    // token -> sequence it belongs to
-    torch::Tensor tpos = torch::arange(T, i64);
-    torch::Tensor ends = b.cu_seqlens_q.slice(0, 1, S + 1).contiguous();
-    torch::Tensor seq_idx = torch::searchsorted(ends, tpos, /*out_int32=*/false, /*right=*/true);
-
-    // where each new K/V goes in the paged cache
-    torch::Tensor blk = b.block_tables.index({seq_idx, torch::div(b.positions, BS, "floor")});
-    torch::Tensor slot = blk * BS + b.positions.remainder(BS);
-
-    torch::Tensor token_kv_len;                         // fused path
-    torch::Tensor q_idx, kv_blk, kv_off, mask;          // padded fallback path
-    if (fused) {
-        token_kv_len = b.positions + 1;                 // each token attends to positions 0..pos: causal for free
-    } else {
-        torch::Tensor starts = b.cu_seqlens_q.slice(0, 0, S);
-        q_idx = tpos - starts.index_select(0, seq_idx);
-
-        torch::Tensor kvp = torch::arange(max_kv, i64);
-        kv_blk = b.block_tables.index({Slice(), torch::div(kvp, BS, "floor")}).clamp_min(0);
-        kv_off = kvp.remainder(BS);
-
-        torch::Tensor qpos = torch::zeros({S, max_q}, i64);
-        qpos.index_put_({seq_idx, q_idx}, b.positions);
-        torch::Tensor qvalid = torch::zeros({S, max_q}, i64.dtype(torch::kBool));
-        qvalid.index_put_({seq_idx, q_idx}, torch::ones({T}, i64.dtype(torch::kBool)));
-        torch::Tensor kv_row = kvp.view({1, 1, -1});
-        torch::Tensor allowed = (kv_row <= qpos.unsqueeze(2)) & (kv_row < b.kv_lens.view({S, 1, 1}));
-        allowed.select(2, 0).logical_or_(qvalid.logical_not());
-        mask = allowed.unsqueeze(1);
-    }
-
-    torch::Tensor cos = cos_.index_select(0, b.positions).unsqueeze(1);
-    torch::Tensor sin = sin_.index_select(0, b.positions).unsqueeze(1);
-
-    torch::Tensor h = embed_.index_select(0, b.tokens);
-    for (int32_t l = 0; l < cfg_.n_layers; ++l) {
-        const Layer& L = layers_[l];
-
-        torch::Tensor x = rms_norm(h, L.attn_norm, cfg_.norm_eps);
-        torch::Tensor q = at::linear(x, L.wq).view({T, H, hd});
-        torch::Tensor k = at::linear(x, L.wk).view({T, KV, hd});
-        torch::Tensor v = at::linear(x, L.wv).view({T, KV, hd});
-
-        q = rms_norm(q, L.q_norm, cfg_.norm_eps);      // Qwen3: RMSNorm over head_dim, per head, BEFORE RoPE
-        k = rms_norm(k, L.k_norm, cfg_.norm_eps);
-        q = rope(q, cos, sin, half);
-        k = rope(k, cos, sin, half);
-
-        // write this step's K/V first: the kernel (and the gather) read them back from the cache
-        k_cache_.select(0, l).view({-1, KV, hd}).index_copy_(0, slot, k);
-        v_cache_.select(0, l).view({-1, KV, hd}).index_copy_(0, slot, v);
-
-        torch::Tensor o;
-        if (fused) {
-#ifdef CPPVLLM_HAS_CUDA_KERNELS
-            torch::Tensor att = torch::empty_like(q);   // [T, H, hd]
-            paged_attention(att, q.contiguous(), k_cache_.select(0, l), v_cache_.select(0, l),
-                            b.block_tables, seq_idx, token_kv_len, scale);
-            o = att.view({T, H * hd});
-#endif
-        } else {
-            torch::Tensor keys = k_cache_.select(0, l).index({kv_blk, kv_off}).transpose(1, 2);   // [S, KV, max_kv, hd]
-            torch::Tensor vals = v_cache_.select(0, l).index({kv_blk, kv_off}).transpose(1, 2);
-            keys = keys.repeat_interleave(rep, 1);                                                // [S, H, max_kv, hd]
-            vals = vals.repeat_interleave(rep, 1);
-
-            torch::Tensor q_pad = torch::zeros({S, max_q, H, hd}, q.options());
-            q_pad.index_put_({seq_idx, q_idx}, q);
-            torch::Tensor att = torch::scaled_dot_product_attention(
-                q_pad.transpose(1, 2), keys, vals, mask, /*dropout_p=*/0.0, /*is_causal=*/false, c10::nullopt);
-            o = att.transpose(1, 2).index({seq_idx, q_idx}).reshape({T, H * hd});
-        }
-        h = h + at::linear(o, L.wo);
-
-        x = rms_norm(h, L.ffn_norm, cfg_.norm_eps);
-        h = h + at::linear(torch::silu(at::linear(x, L.gate)) * at::linear(x, L.up), L.down);
-    }
-
-    torch::Tensor last = b.cu_seqlens_q.slice(0, 1, S + 1) - 1;   // last token of each sequence
+    const int64_t S = b.kv_lens.size(0);
+    torch::Tensor h = forward_backbone(b);
+    torch::Tensor last = b.cu_seqlens_q.slice(0, 1, S + 1) - 1;
     torch::Tensor rows = h.index_select(0, last);
     if (sample_rows.defined()) rows = rows.index_select(0, sample_rows);
-    return at::linear(rms_norm(rows, final_norm_, cfg_.norm_eps), lm_head_).to(torch::kFloat);
+    return compute_logits(rows);
 }

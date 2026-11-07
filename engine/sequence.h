@@ -13,6 +13,8 @@ enum class Status: uint8_t {
         FINISHED = 2
 };
 
+inline constexpr int32_t kPendingToken = -1;
+
 struct SamplingParams {  
     
     float temperature = 1.0f; 
@@ -35,6 +37,7 @@ struct Sequence {
     uint32_t num_prompt_tokens;  
     uint32_t num_cached_tokens = 0; 
     uint32_t num_scheduled_tokens = 0;
+    uint32_t num_inflight = 0;   // launched steps not yet postprocessed that contain this sequence
 
     Sequence(uint64_t id, std::span<const int32_t> prompt, const SamplingParams& p = {})  
     :  
@@ -46,30 +49,15 @@ struct Sequence {
         block_table.reserve((num_prompt_tokens + params.max_tokens + BLOCK_SIZE - 1) / BLOCK_SIZE);
        } 
        
-       [[nodiscard]] size_t size() const noexcept 
-        { 
-        return token_ids.size(); 
-        }
+       [[nodiscard]] size_t size() const noexcept { return token_ids.size(); }
 
-       [[nodiscard]] size_t num_blocks() const noexcept 
-        { 
-          return (size() + BLOCK_SIZE - 1) / BLOCK_SIZE;  
-        }
+       [[nodiscard]] size_t num_blocks() const noexcept {  return (size() + BLOCK_SIZE - 1) / BLOCK_SIZE; }
        
-       [[nodiscard]] size_t last_block_num_tokens() const noexcept
-        {  
-         return size() - ((num_blocks() - 1) * BLOCK_SIZE);  
-        }
+       [[nodiscard]] size_t last_block_num_tokens() const noexcept {  return size() - ((num_blocks() - 1) * BLOCK_SIZE);}
        
-       [[nodiscard]] size_t num_completion_tokens() const noexcept 
-         {
-            return size() - num_prompt_tokens; 
-         }
+       [[nodiscard]] size_t num_completion_tokens() const noexcept { return size() - num_prompt_tokens; }
        
-       [[nodiscard]] size_t num_uncached_tokens() const noexcept 
-       {
-        return size() - num_cached_tokens; 
-       }
+       [[nodiscard]] size_t num_uncached_tokens() const noexcept {return size() - num_cached_tokens; }
         
        //Zero copy view of block(i)//  
        [[nodiscard]] std::span<const int32_t> block(size_t i) const noexcept 
@@ -93,9 +81,10 @@ struct Sequence {
 
        void reset_for_preemption() 
          {  
+            assert(num_inflight == 0);
             status = Status::WAITING;   
             block_table.clear();  
             num_cached_tokens = 0;  
             num_scheduled_tokens = 0;  
          }
-};  
+};

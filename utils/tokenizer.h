@@ -9,8 +9,6 @@
 #include <unordered_map>
 #include <vector> 
 
-
-// Qwen3 byte-level BPE tokenizer (reads tokenizer.json). Qwen has no BOS token: prompts start directly with the text.
 class Tokenizer {  
 
 public:  
@@ -18,7 +16,7 @@ public:
   [[nodiscard]] std::vector<int32_t> encode(std::string_view text, bool allow_special = false) const;  
   [[nodiscard]] std::string decode(std::span<const int32_t> ids, bool skip_special = false) const;   
   
-  [[nodiscard]] int32_t eos_id() const noexcept {return first_special_ + 2;}   // <|im_end|>, ends an assistant turn
+  [[nodiscard]] int32_t eos_id() const noexcept {return first_special_ + 2;}  
   [[nodiscard]] size_t num_ranks() const noexcept {return id_to_bytes_.size();}
 
 private:  

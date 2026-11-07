@@ -6,30 +6,32 @@
 #include <string>
 #include <vector>
 
-// Qwen3 chat format (ChatML), the C++ version of tokenizer.apply_chat_template(..., add_generation_prompt=True).
-// Thinking mode is on by default, so the model starts its answer with <think> by itself.
 static std::string apply_chat_template(const std::string& user) {
     return "<|im_start|>user\n" + user + "<|im_end|>\n<|im_start|>assistant\n";
 }
 
 int main(int argc, char** argv) {
     if (argc < 2) { std::cerr << "usage: example <model_dir>\n"; return 2; }
+
+    const int tp_size = 1;   
+
     const std::string path = argv[1];
 
     Tokenizer tokenizer = Tokenizer::load(path);
 
     EngineConfig cfg;
     cfg.model_path    = path;
-    cfg.enforce_eager = true;
+    cfg.tensor_parallel_size = tp_size;
+    cfg.enforce_eager = false;
     LLMEngine llm(cfg);
 
     SamplingParams sampling_params;
     sampling_params.temperature = 0.6f;
-    sampling_params.max_tokens  = 512;   // Qwen3 thinks first, so give it room
+    sampling_params.max_tokens  = 512;   
 
     std::vector<std::string> prompts = {
         "introduce yourself",
-        "list all prime numbers within 100",
+        "explain deep learning",
     };
     for (auto& p : prompts) p = apply_chat_template(p);
 
